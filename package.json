@@ -1,0 +1,25 @@
+{
+  "name": "polsent",
+  "version": "1.0.0",
+  "description": "셀러딜 — 쿠팡 파트너스 핫딜/가격 이력 웹",
+  "type": "module",
+  "scripts": {
+    "start": "tsx coupang-partners/web/server.ts",
+    "web": "tsx coupang-partners/web/server.ts",
+    "collect": "tsx coupang-partners/web/collect-prices.ts",
+    "goldbox": "tsx coupang-partners/collect.ts goldbox",
+    "search": "tsx coupang-partners/collect.ts search",
+    "best": "tsx coupang-partners/collect.ts best"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

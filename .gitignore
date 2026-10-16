@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+
+coupang-partners/output/
+coupang-partners/web/price-history.json
+coupang-partners/web/_*.png
+coupang-partners/web/_verify.ts
+dist/
