@@ -7,7 +7,9 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import { CoupangPartnersClient } from "../client.js";
 import { collectPriceSnapshot } from "./collector.js";
+import { attachStores, whenSaved } from "./db.js";
 import { PriceHistoryStore } from "./price-history.js";
+import { UserLibrary } from "./user-library.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../..");
@@ -19,9 +21,12 @@ const client = new CoupangPartnersClient({
   subId: process.env.COUPANG_PARTNERS_SUB_ID || undefined,
 });
 const history = new PriceHistoryStore(path.join(__dirname, "price-history.json"));
+const library = new UserLibrary(path.join(__dirname, "user-library.json"));
 
 async function main() {
+  await attachStores(history, library);
   const result = await collectPriceSnapshot(client, history);
+  await whenSaved();
   console.log(
     `[OK] 수집 ${result.ok}개 성공 / ${result.fail}개 실패 / 추적 ${history.productCount}상품`,
   );

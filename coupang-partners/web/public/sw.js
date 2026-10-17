@@ -1,4 +1,4 @@
-const CACHE = "sellerdeal-v1";
+const CACHE = "sellerdeal-v3";
 const PRECACHE = ["/", "/app.css", "/app.js", "/favicon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
@@ -13,6 +13,38 @@ self.addEventListener("activate", (event) => {
     ),
   );
   self.clients.claim();
+});
+
+self.addEventListener("push", (event) => {
+  let data = { title: "셀러딜", body: "가격 알림", url: "/" };
+  try {
+    data = { ...data, ...(event.data ? event.data.json() : {}) };
+  } catch {
+    data.body = event.data ? event.data.text() : data.body;
+  }
+  event.waitUntil(
+    self.registration.showNotification(data.title, {
+      body: data.body,
+      data,
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const target = new URL(event.notification.data?.url || "/", self.location.origin).href;
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (list) => {
+      for (const client of list) {
+        if (new URL(client.url).origin !== self.location.origin) continue;
+        await client.focus();
+        if ("navigate" in client) await client.navigate(target);
+        else client.postMessage({ type: "open", url: target });
+        return;
+      }
+      await self.clients.openWindow(target);
+    }),
+  );
 });
 
 self.addEventListener("fetch", (event) => {
