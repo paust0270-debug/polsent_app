@@ -5,6 +5,12 @@ import type { CollectedProduct } from "../client.js";
 export interface PricePoint {
   date: string;
   price: number;
+  at?: number;
+}
+
+export interface Observation {
+  at: number;
+  price: number;
 }
 
 export interface TrackedProduct {
@@ -16,9 +22,11 @@ export interface TrackedProduct {
   isRocket: boolean | null;
   isFreeShipping: boolean | null;
   lastPrice: number;
+  originalPrice: number | null;
   lastSeenAt: number;
   source: string;
   daily: Record<string, number>;
+  observations: Observation[];
 }
 
 export interface ProductView extends CollectedProduct {
@@ -44,6 +52,7 @@ export interface HistoryFile {
 }
 
 const KEEP_DAYS = 60;
+const TICK_GAP_MS = 30 * 60 * 1000;
 
 export function kstDate(ts = Date.now()): string {
   return new Date(ts + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -100,6 +109,56 @@ function dailyPoints(daily: Record<string, number>): PricePoint[] {
     .map(([date, price]) => ({ date, price }));
 }
 
+function normalizeTracked(product: TrackedProduct): TrackedProduct {
+  const daily = product.daily || {};
+  const raw = Array.isArray(product.observations) ? product.observations : [];
+  const observations = raw.filter((item) => item && Number.isFinite(item.at) && Number.isFinite(item.price));
+  return {
+    ...product,
+    originalPrice: product.originalPrice ?? null,
+    daily,
+    observations: observations.length ? observations : ticksFromDaily(daily),
+  };
+}
+
+function ticksFromDaily(daily: Record<string, number>): Observation[] {
+  return Object.entries(daily)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([day, price]) => ({ at: Date.parse(`${day}T12:00:00+09:00`), price }))
+    .filter((item) => Number.isFinite(item.at) && Number.isFinite(item.price));
+}
+
+function seedObservations(existing?: TrackedProduct): Observation[] {
+  if (existing?.observations?.length) return existing.observations;
+  if (!existing?.daily) return [];
+  return ticksFromDaily(existing.daily);
+}
+
+function nextObservations(existing: Observation[], price: number, now: number): Observation[] {
+  const list = existing.map((item) => ({ ...item }));
+  const last = list[list.length - 1];
+  if (last && last.at === now) {
+    last.price = price;
+  } else if (!last || now - last.at >= TICK_GAP_MS || last.price !== price) {
+    list.push({ at: now, price });
+  }
+  const cutoff = now - KEEP_DAYS * 86_400_000;
+  return list.filter((item) => item.at >= cutoff).slice(-500);
+}
+
+function observationPoints(tracked?: TrackedProduct): PricePoint[] {
+  const observations = seedObservations(tracked);
+  if (observations.length) {
+    return observations.map((item) => ({ date: kstDate(item.at), price: item.price, at: item.at }));
+  }
+  return dailyPoints(tracked?.daily ?? {});
+}
+
+function listPrice(original: number | null | undefined, sale: number): number | null {
+  if (original == null || !Number.isFinite(original) || original <= sale) return null;
+  return Math.round(original);
+}
+
 function pruneDaily(daily: Record<string, number>): Record<string, number> {
   const keys = Object.keys(daily).sort();
   if (keys.length <= KEEP_DAYS) return daily;
@@ -141,6 +200,9 @@ export class PriceHistoryStore {
       const daily = { ...(existing?.daily ?? {}) };
       daily[day] =
         daily[day] == null ? product.productPrice : Math.min(daily[day], product.productPrice);
+      const listed = listPrice(product.originalPrice, product.productPrice);
+      const kept = listPrice(existing?.originalPrice, product.productPrice);
+      const observations = nextObservations(seedObservations(existing), product.productPrice, now);
       this.file.products[id] = {
         productId: id,
         productName: product.productName || existing?.productName || "",
@@ -150,9 +212,11 @@ export class PriceHistoryStore {
         isRocket: product.isRocket ?? existing?.isRocket ?? null,
         isFreeShipping: product.isFreeShipping ?? existing?.isFreeShipping ?? null,
         lastPrice: product.productPrice,
+        originalPrice: listed ?? kept,
         lastSeenAt: now,
         source: product.source || existing?.source || "",
         daily: pruneDaily(daily),
+        observations,
       };
     }
     this.save();
@@ -218,7 +282,7 @@ export class PriceHistoryStore {
       productId: tracked.productId,
       productName: tracked.productName,
       productPrice: tracked.lastPrice,
-      originalPrice: null,
+      originalPrice: tracked.originalPrice ?? null,
       productImage: tracked.productImage,
       productUrl: tracked.productUrl,
       isRocket: tracked.isRocket,
@@ -233,7 +297,7 @@ export class PriceHistoryStore {
     const id = String(product.productId ?? "");
     const tracked = id ? this.file.products[id] : undefined;
     const daily = tracked?.daily ?? {};
-    const points = dailyPoints(daily);
+    const points = observationPoints(tracked);
     const current = product.productPrice ?? tracked?.lastPrice ?? null;
     const stats = analyze(daily, current);
     const previous = points.length >= 2 ? points[points.length - 2].price : product.originalPrice;
@@ -304,10 +368,14 @@ function migrate(raw: unknown): HistoryFile {
   }
   const obj = raw as Record<string, unknown>;
   if (obj.version === 2 && obj.products && typeof obj.products === "object") {
+    const products: Record<string, TrackedProduct> = {};
+    for (const [id, value] of Object.entries(obj.products as Record<string, TrackedProduct>)) {
+      products[id] = normalizeTracked(value);
+    }
     return {
       version: 2,
       lastCollectAt: typeof obj.lastCollectAt === "number" ? obj.lastCollectAt : null,
-      products: obj.products as Record<string, TrackedProduct>,
+      products,
     };
   }
 
@@ -334,9 +402,11 @@ function migrate(raw: unknown): HistoryFile {
       isRocket: null,
       isFreeShipping: null,
       lastPrice,
+      originalPrice: null,
       lastSeenAt,
       source: "",
       daily: pruneDaily(daily),
+      observations: ticksFromDaily(daily),
     };
   }
   return { version: 2, lastCollectAt: null, products };

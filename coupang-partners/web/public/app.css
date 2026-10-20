@@ -415,12 +415,12 @@ footer { padding-bottom: 96px; }
   box-shadow: 0 10px 30px rgba(16,24,20,.12);
 }
 .dock button {
-  min-width: 58px;
+  min-width: 48px;
   border: 0;
   background: transparent;
   font: inherit;
   font-weight: 700;
-  padding: 10px 14px;
+  padding: 10px 12px;
   border-radius: 999px;
   cursor: pointer;
 }
@@ -433,6 +433,19 @@ footer { padding-bottom: 96px; }
 .badge.low { background: #ffe4e6; color: var(--red); }
 .badge.stale { background: #fff7ed; color: #c2410c; }
 .unit { color: var(--muted); font-size: 12px; font-weight: 700; }
+.reason { margin: 4px 0 0; color: var(--green-dark); font-size: 12px; font-weight: 700; line-height: 1.4; }
+.family-link {
+  margin-top: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
 .sheet-note { margin: 0 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .sheet-note:empty { display: none; }
 .alts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }

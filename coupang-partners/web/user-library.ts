@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 
-export type AlertKind = "lowest" | "target" | "restore" | "restock" | "keyword" | "rule" | "afterbuy" | "digest";
+export type AlertKind = "lowest" | "target" | "restore" | "restock" | "keyword" | "rule" | "afterbuy" | "digest" | "deal" | "rebuy";
 
 export interface UserAlert {
   id: string;
@@ -64,6 +64,9 @@ export interface LibraryFile {
   settings: LibrarySettings;
   alerts: UserAlert[];
   dedupe: Record<string, string>;
+  pinCursor: number;
+  rebuyDays: Record<string, number>;
+  pending: Record<string, { name: string; url: string }>;
 }
 
 const DEFAULT_SETTINGS: LibrarySettings = {
@@ -97,6 +100,9 @@ function emptyFile(): LibraryFile {
     settings: { ...DEFAULT_SETTINGS },
     alerts: [],
     dedupe: {},
+    pinCursor: 0,
+    rebuyDays: {},
+    pending: {},
   };
 }
 
@@ -164,6 +170,7 @@ export class UserLibrary {
       this.file.watches = [id, ...this.file.watches.filter((item) => item !== id)].slice(0, 200);
     } else {
       this.file.watches = this.file.watches.filter((item) => item !== id);
+      delete this.file.pending[id];
       for (const folder of this.file.folders) {
         folder.productIds = folder.productIds.filter((item) => item !== id);
       }
@@ -347,9 +354,59 @@ export class UserLibrary {
     return next;
   }
 
-  pushAlert(alert: Omit<UserAlert, "id" | "at" | "read"> & { at?: number }) {
+  missCount(id: string) {
+    return this.file.misses[id] || 0;
+  }
+
+  nextPinBatch(exclude: Set<string>, limit: number): string[] {
+    const ids = this.file.watches;
+    if (!ids.length || limit <= 0) return [];
+    const start = this.file.pinCursor % ids.length;
+    const ordered = [...ids.slice(start), ...ids.slice(0, start)];
+    const batch: string[] = [];
+    let consumed = 0;
+    for (const id of ordered) {
+      consumed += 1;
+      if (!exclude.has(id)) batch.push(id);
+      if (batch.length >= limit) break;
+    }
+    this.file.pinCursor = (start + consumed) % ids.length;
+    this.save();
+    return batch;
+  }
+
+  rebuyDays(id: string) {
+    const days = this.file.rebuyDays[id];
+    return days && days > 0 ? days : null;
+  }
+
+  setRebuy(productId: string, days: number | null) {
+    if (!productId) return;
+    if (days == null || !Number.isFinite(days) || days <= 0) delete this.file.rebuyDays[productId];
+    else this.file.rebuyDays[productId] = Math.min(365, Math.max(1, Math.round(days)));
+    this.save();
+  }
+
+  pendingName(id: string) {
+    return this.file.pending[id]?.name || "";
+  }
+
+  setPending(id: string, name: string, url: string) {
+    if (!id || !name.trim()) return;
+    this.file.pending[id] = { name: name.trim().slice(0, 80), url: url.slice(0, 500) };
+    this.rememberWatch(id);
+    this.save();
+  }
+
+  clearPending(id: string) {
+    if (!this.file.pending[id]) return;
+    delete this.file.pending[id];
+    this.save();
+  }
+
+  pushAlert(alert: Omit<UserAlert, "id" | "at" | "read"> & { at?: number; dedupe?: string }) {
     const day = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    const key = `${alert.kind}:${alert.productId}:${day}`;
+    const key = alert.dedupe || `${alert.kind}:${alert.productId}:${day}`;
     if (this.file.dedupe[key]) return false;
     this.file.dedupe[key] = day;
     this.file.alerts.unshift({
@@ -364,6 +421,7 @@ export class UserLibrary {
     this.file.alerts = this.file.alerts.slice(0, 100);
     const keep = new Set(Object.values(recentDays(3)));
     for (const dedupeKey of Object.keys(this.file.dedupe)) {
+      if (dedupeKey.startsWith("rebuy:")) continue;
       if (!keep.has(this.file.dedupe[dedupeKey])) delete this.file.dedupe[dedupeKey];
     }
     this.save();
@@ -421,6 +479,9 @@ export class UserLibrary {
       alerts: Array.isArray(raw.alerts) ? raw.alerts : [],
       dedupe: raw.dedupe && typeof raw.dedupe === "object" ? raw.dedupe : {},
       displayName: typeof raw.displayName === "string" && raw.displayName.trim() ? raw.displayName : "나",
+      pinCursor: typeof raw.pinCursor === "number" && Number.isFinite(raw.pinCursor) ? Math.max(0, Math.floor(raw.pinCursor)) : 0,
+      rebuyDays: raw.rebuyDays && typeof raw.rebuyDays === "object" ? raw.rebuyDays : {},
+      pending: raw.pending && typeof raw.pending === "object" ? raw.pending : {},
     };
   }
 

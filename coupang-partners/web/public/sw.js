@@ -1,4 +1,4 @@
-const CACHE = "sellerdeal-v3";
+const CACHE = "sellerdeal-v6";
 const PRECACHE = ["/", "/app.css", "/app.js", "/favicon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {

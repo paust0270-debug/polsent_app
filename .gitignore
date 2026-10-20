@@ -7,6 +7,7 @@ coupang-partners/output/
 coupang-partners/web/price-history.json
 coupang-partners/web/user-library.json
 coupang-partners/web/vapid.json
+coupang-partners/web/business-proposals.json
 coupang-partners/web/_*.png
 coupang-partners/web/_verify.ts
 dist/

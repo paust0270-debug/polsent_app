@@ -61,7 +61,9 @@ export class CoupangPartnersClient {
   }
 
   async deepLink(urls: string[]): Promise<unknown> {
-    return this.post(`${OPENAPI}/v1/deeplink`, { coupangUrls: urls });
+    const body: { coupangUrls: string[]; subId?: string } = { coupangUrls: urls };
+    if (this.config.subId) body.subId = this.config.subId;
+    return this.post(`${OPENAPI}/v1/deeplink`, body);
   }
 
   private async get(pathAndQuery: string): Promise<unknown> {

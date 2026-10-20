@@ -5,8 +5,10 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import { BEST_CATEGORIES } from "../catalog.js";
 import { CoupangPartnersClient, type CollectedProduct } from "../client.js";
+import { AccountBook } from "./accounts.js";
 import { collectPriceSnapshot, startPriceCollector } from "./collector.js";
 import { attachStores } from "./db.js";
+import { annotateDeals, buyAdvice, type DealView } from "./deals.js";
 import { startDigest, buildDigest } from "./digest.js";
 import { cheaperAlternatives, staleHours, unitPriceLabel, weekdayHint } from "./insights.js";
 import { kstDate, PriceHistoryStore } from "./price-history.js";
@@ -18,6 +20,14 @@ const rootDir = path.resolve(__dirname, "../..");
 dotenv.config({ path: path.join(rootDir, ".env") });
 
 const PORT = Number(process.env.PARTNERS_WEB_PORT || 3780);
+const STORE_NAME = (process.env.STORE_NAME || "셀러딜").trim() || "셀러딜";
+const STORE_TAGLINE = (process.env.STORE_TAGLINE || "번호 또는 상품 이름으로 검색하세요").trim();
+const STORE_HOSTS = new Set(
+  (process.env.STORE_HOST || "")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean),
+);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const GOLD_TTL = 15 * 60 * 1000;
 const SEARCH_TTL = 10 * 60 * 1000;
@@ -30,7 +40,15 @@ const client = new CoupangPartnersClient({
   subId: process.env.COUPANG_PARTNERS_SUB_ID || undefined,
 });
 const history = new PriceHistoryStore(path.join(__dirname, "price-history.json"));
-const library = new UserLibrary(path.join(__dirname, "user-library.json"));
+const rootLibrary = new UserLibrary(path.join(__dirname, "user-library.json"));
+const accountBook = new AccountBook(rootLibrary);
+const library: UserLibrary = new Proxy(rootLibrary, {
+  get(target, prop) {
+    const current = accountBook.context.getStore() ?? target;
+    const value = Reflect.get(current, prop, current);
+    return typeof value === "function" ? value.bind(current) : value;
+  },
+});
 const pushPublicKey = initPush(path.join(__dirname, "vapid.json"));
 
 type CacheEntry = { at: number; ttl: number; products: CollectedProduct[] };
@@ -47,6 +65,7 @@ async function cached(
   }
   const products = await loader();
   history.record(products);
+  dealMap = null;
   cache.set(key, { at: Date.now(), ttl, products });
   return { products: history.view(products), cached: false, at: Date.now() };
 }
@@ -61,6 +80,11 @@ const MIME: Record<string, string> = {
   ".png": "image/png",
   ".webmanifest": "application/manifest+json",
 };
+
+function isStoreHost(req: http.IncomingMessage) {
+  const host = String(req.headers.host || "").split(":")[0].trim().toLowerCase();
+  return STORE_HOSTS.has(host);
+}
 
 function send(res: http.ServerResponse, status: number, body: unknown, type = "application/json; charset=utf-8") {
   const headers = {
@@ -101,9 +125,26 @@ function collectMeta() {
   };
 }
 
+let dealMap: Map<string, DealView> | null = null;
+let dealAt = 0;
+
+function dealIndex() {
+  if (dealMap && Date.now() - dealAt < 3000) return dealMap;
+  dealAt = Date.now();
+  dealMap = new Map(
+    annotateDeals(history.listAll(), {
+      watched: new Set(library.watches),
+      keywords: library.keywords,
+    }).map((item) => [String(item.productId), item]),
+  );
+  return dealMap;
+}
+
 function decorate<T extends { productId?: string | number | null }>(products: T[]) {
+  const deals = dealIndex();
   return products.map((product) => {
     const id = String(product.productId ?? "");
+    const deal = deals.get(id);
     const row = product as T & {
       productName?: string | null;
       productPrice?: number | null;
@@ -120,10 +161,20 @@ function decorate<T extends { productId?: string | number | null }>(products: T[
       folderId: library.folderOf(id),
       purchasePrice: purchase?.price ?? null,
       purchasedAt: purchase?.at ?? null,
+      rebuyDays: library.rebuyDays(id),
+      advice: buyAdvice(product as DealView),
       snoozeUntil: library.snoozeUntil(id),
       belowAvgPercent: rule.belowAvgPercent,
       dropAmount: rule.dropAmount,
       unitLabel: unitPriceLabel(row.productName || "", row.productPrice ?? null),
+      missCount: library.missCount(id),
+      familyKey: deal?.familyKey || "",
+      familyName: deal?.familyName || row.productName || "",
+      brand: deal?.brand || "",
+      dealScore: deal?.dealScore ?? 0,
+      reasons: deal?.reasons || [],
+      unitRank: deal?.unitRank ?? null,
+      familySize: deal?.familySize ?? 1,
       staleHours: staleHours(row.lastSeenAt ?? null),
       weekdayHint: weekdayHint(row.pricePoints || []),
     };
@@ -160,7 +211,97 @@ function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
+function coupangProductId(text: string) {
+  const match = text.match(/products\/(\d+)|productId=(\d+)/i);
+  return match ? match[1] || match[2] || "" : "";
+}
+
+function cleanTitle(value: string) {
+  const title = value.replace(/\s*[-|–]\s*쿠팡.*$/i, "").replace(/\s+/g, " ").trim().slice(0, 80);
+  if (title.length < 2) return "";
+  if (/access denied|just a moment|forbidden|captcha|로봇|로그인|오류|error/i.test(title)) return "";
+  return title;
+}
+
+async function pageTitle(url: string) {
+  if (!/^https:\/\/([a-z0-9-]+\.)*coupang\.com\//i.test(url)) return "";
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(4000),
+      redirect: "follow",
+      headers: { "user-agent": "Mozilla/5.0" },
+    });
+    const html = (await res.text()).slice(0, 120_000);
+    const og = html.match(/property="og:title"\s+content="([^"]+)"/i) || html.match(/<title>([^<]+)<\/title>/i);
+    return og ? cleanTitle(og[1].replace(/&amp;/g, "&").replace(/&#39;/g, "'")) : "";
+  } catch {
+    return "";
+  }
+}
+
+async function trackProduct(text: string, title: string) {
+  const raw = text.trim();
+  const id = coupangProductId(raw);
+  const named = cleanTitle(title) || (/^https?:\/\//i.test(raw) ? "" : raw);
+  if (id && history.getById(id)?.productName) {
+    library.setWatch(id, true);
+    library.clearPending(id);
+    return { ok: true, productId: id, pending: false };
+  }
+  let query = named;
+  if (!query && /^https?:\/\//i.test(raw)) query = await pageTitle(raw);
+  if (query) {
+    try {
+      const found = await client.search(query.slice(0, 30), 10);
+      const hit = id ? found.find((item) => String(item.productId) === id) : null;
+      if (hit) {
+        history.record([hit]);
+        const productId = String(hit.productId);
+        library.setWatch(productId, true);
+        library.clearPending(productId);
+        return { ok: true, productId, pending: false };
+      }
+    } catch (err) {
+      console.error("[track]", err instanceof Error ? err.message : err);
+    }
+    if (id) {
+      library.setPending(id, query, raw);
+      return { ok: true, productId: id, pending: true, name: query };
+    }
+  }
+  if (id) return { ok: false, needName: true, productId: id, url: /^https?:\/\//i.test(raw) ? raw : "" };
+  return { ok: false, error: "쿠팡 링크나 상품명을 입력해 주세요." };
+}
+
 async function handleUser(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+  if (url.pathname === "/api/account" && req.method === "GET") {
+    const account = await accountBook.currentAccount();
+    if (!account) {
+      send(res, 401, { error: "계정이 없습니다." });
+      return true;
+    }
+    send(res, 200, account);
+    return true;
+  }
+  if (url.pathname === "/api/account" && req.method === "POST") {
+    send(res, 200, await accountBook.openNew());
+    return true;
+  }
+  if (url.pathname === "/api/account/restore" && req.method === "POST") {
+    const body = await readJson(req);
+    const account = await accountBook.restore(String(body.code || ""));
+    if (!account) {
+      send(res, 404, { error: "복구 코드를 찾지 못했습니다." });
+      return true;
+    }
+    send(res, 200, account);
+    return true;
+  }
+  if (url.pathname === "/api/track" && req.method === "POST") {
+    const body = await readJson(req);
+    send(res, 200, await trackProduct(String(body.text || ""), String(body.title || "")));
+    return true;
+  }
   if (url.pathname === "/api/library" && req.method === "GET") {
     send(res, 200, library.snapshot());
     return true;
@@ -207,20 +348,30 @@ async function handleUser(req: http.IncomingMessage, res: http.ServerResponse, u
     });
     return true;
   }
+  if (url.pathname === "/api/storefront" && req.method === "GET") {
+    send(res, 200, await storefrontPayload());
+    return true;
+  }
+  if (url.pathname === "/api/storefront/proposal" && req.method === "POST") {
+    try {
+      saveProposal(await readJson(req));
+      send(res, 200, { ok: true });
+    } catch (error) {
+      send(res, 400, { error: error instanceof Error ? error.message : "제안을 저장하지 못했습니다." });
+    }
+    return true;
+  }
   if (url.pathname === "/api/home" && req.method === "GET") {
     const gold = await cached("goldbox", GOLD_TTL, () => client.goldbox());
-    const timing = uniqueProducts([
-      ...gold.products.filter((product) => product.isTiming),
-      ...history.listTiming(12),
-    ]).slice(0, 12);
+    dealMap = null;
+    const feed = [...dealIndex().values()].sort((a, b) => b.dealScore - a.dealScore || (b.dropPercent ?? -999) - (a.dropPercent ?? -999)).slice(0, 48);
     send(res, 200, {
-      goldbox: decorate(gold.products),
-      timing: decorate(timing),
-      lowest: decorate(history.listLowest(12)),
+      feed: decorate(feed),
+      families: new Set(feed.map((item) => item.familyKey).filter(Boolean)).size,
       cached: gold.cached,
       at: gold.at,
       source: "home",
-      title: "지금 사기 좋은 딜",
+      title: "지금 살 만한 순",
       ...collectMeta(),
     });
     return true;
@@ -299,6 +450,13 @@ async function handleUser(req: http.IncomingMessage, res: http.ServerResponse, u
     const body = await readJson(req);
     const price = body.price == null || body.price === "" ? null : Number(body.price);
     library.setPurchase(String(body.productId || ""), price);
+    send(res, 200, library.snapshot());
+    return true;
+  }
+  if (url.pathname === "/api/library/rebuy") {
+    const body = await readJson(req);
+    const days = body.days == null || body.days === "" ? null : Number(body.days);
+    library.setRebuy(String(body.productId || ""), days);
     send(res, 200, library.snapshot());
     return true;
   }
@@ -440,6 +598,165 @@ function escapeHtml(value: string) {
     .replaceAll('"', "&quot;");
 }
 
+const CATALOG_PATH = path.join(__dirname, "storefront-catalog.json");
+const PROPOSAL_PATH = path.join(__dirname, "business-proposals.json");
+const PROPOSAL_TYPES = new Set(["광고", "공동구매", "협찬", "제품제공", "기타"]);
+const PROPOSAL_CATEGORIES = new Set([
+  "육아·키즈",
+  "홈·리빙",
+  "식품·요리",
+  "뷰티",
+  "패션",
+  "디지털·가전",
+  "가구·인테리어",
+  "스포츠·건강",
+  "여행·아웃도어",
+  "교육·커리어",
+  "취미·아트",
+  "반려동물",
+  "기타",
+]);
+const PROPOSAL_PAYS = new Set(["cash", "profit_share", "negotiation"]);
+
+function clip(value: unknown, max: number) {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+function saveProposal(body: Record<string, unknown>) {
+  if (clip(body.website, 80)) return;
+  const type = clip(body.type, 20);
+  const brand = clip(body.brand, 100);
+  const product = clip(body.product, 100);
+  const categories = Array.isArray(body.categories)
+    ? [...new Set(body.categories.map((item) => clip(item, 20)).filter((item) => PROPOSAL_CATEGORIES.has(item)))].slice(0, 5)
+    : [];
+  const detail = clip(body.detail, 2000);
+  const letter = clip(body.letter, 2000);
+  const payType = clip(body.payType, 20);
+  const payAmount = clip(body.payAmount, 20);
+  const start = clip(body.start, 10);
+  const end = clip(body.end, 10);
+  const contactName = clip(body.contactName, 40);
+  const email = clip(body.email, 80);
+  const phone = clip(body.phone, 20);
+  if (!PROPOSAL_TYPES.has(type)) throw new Error("캠페인 유형을 선택해 주세요.");
+  if (!brand) throw new Error("브랜드명을 입력해 주세요.");
+  if (!product) throw new Error("상품 또는 서비스명을 입력해 주세요.");
+  if (!categories.length) throw new Error("제품 카테고리를 하나 이상 선택해 주세요.");
+  if (!letter) throw new Error("제안서를 작성해 주세요.");
+  if (!contactName) throw new Error("담당자 이름을 입력해 주세요.");
+  if (!email && !phone) throw new Error("이메일 또는 전화번호를 입력해 주세요.");
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("이메일 형식을 확인해 주세요.");
+  if (payType && !PROPOSAL_PAYS.has(payType)) throw new Error("보상 형태를 확인해 주세요.");
+  const current = fs.existsSync(PROPOSAL_PATH)
+    ? JSON.parse(fs.readFileSync(PROPOSAL_PATH, "utf8"))
+    : [];
+  const list = Array.isArray(current) ? current : [];
+  list.unshift({
+    id: `p-${Date.now().toString(36)}`,
+    at: Date.now(),
+    type,
+    brand,
+    product,
+    categories,
+    detail,
+    letter,
+    payType,
+    payAmount: payType === "negotiation" ? "" : payAmount,
+    start,
+    end,
+    contactName,
+    email,
+    phone,
+  });
+  fs.writeFileSync(PROPOSAL_PATH, JSON.stringify(list.slice(0, 300), null, 2));
+}
+
+async function storefrontPayload() {
+  const catalog = readCatalog();
+  if (catalog) {
+    return {
+      name: STORE_NAME,
+      tagline: STORE_TAGLINE,
+      shelves: catalog.shelves,
+    };
+  }
+  let gold: CollectedProduct[] = [];
+  try {
+    gold = (await cached("goldbox", GOLD_TTL, () => client.goldbox())).products;
+  } catch (error) {
+    console.error("[storefront]", error instanceof Error ? error.message : error);
+  }
+  const all = history.listAll();
+  const byId = new Map(all.map((product) => [String(product.productId), product]));
+  const shelves = [
+    storeShelf("timing", "지금 사기 좋은 타이밍", history.listTiming(40)),
+    storeShelf("lowest", "최근 최저가", history.listLowest(40)),
+    storeShelf("goldbox", "오늘의 골드박스", gold),
+    ...rootLibrary.snapshot().folders.map((folder) =>
+      storeShelf(
+        folder.id,
+        folder.name,
+        folder.productIds.map((id) => byId.get(id)).filter((product) => product != null),
+      ),
+    ),
+    ...categoryShelves(all),
+  ].filter((shelf) => shelf != null);
+  const profileName = STORE_NAME;
+  return {
+    name: profileName,
+    tagline: STORE_TAGLINE,
+    shelves,
+  };
+}
+
+function readCatalog() {
+  try {
+    if (!fs.existsSync(CATALOG_PATH)) return null;
+    const parsed = JSON.parse(fs.readFileSync(CATALOG_PATH, "utf8")) as {
+      shelves?: { id: string; title: string; products: unknown[] }[];
+    };
+    if (!parsed.shelves?.length) return null;
+    return parsed;
+  } catch (error) {
+    console.error("[storefront]", error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
+function categoryShelves(products: CollectedProduct[]) {
+  const groups = new Map<string, CollectedProduct[]>();
+  for (const product of products) {
+    const name = (product.categoryName || "").trim();
+    if (!name) continue;
+    const list = groups.get(name) || [];
+    list.push(product);
+    groups.set(name, list);
+  }
+  return [...groups.entries()]
+    .filter(([, list]) => list.length >= 3)
+    .sort((a, b) => b[1].length - a[1].length)
+    .slice(0, 8)
+    .map(([name, list]) => storeShelf(`cat:${name}`, name, list))
+    .filter((shelf) => shelf != null);
+}
+
+function storeShelf<T extends { productId?: string | number | null; productName?: string | null; productPrice?: number | null; productImage?: string | null; productUrl?: string | null }>(
+  id: string,
+  title: string,
+  products: T[],
+) {
+  const items = uniqueProducts(products).slice(0, 18).map((product) => ({
+    productId: product.productId,
+    productName: product.productName || "",
+    productPrice: product.productPrice ?? null,
+    productImage: product.productImage || "",
+    productUrl: product.productUrl || "",
+  }));
+  if (!items.length) return null;
+  return { id, title, products: items };
+}
+
 function uniqueProducts<T extends { productId?: string | number | null }>(products: T[]) {
   const seen = new Set<string>();
   const rows: T[] = [];
@@ -454,7 +771,8 @@ function uniqueProducts<T extends { productId?: string | number | null }>(produc
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
-
+  const chosen = accountBook.choose(req);
+  await accountBook.context.run(chosen, async () => {
   try {
     if (url.pathname === "/api/categories") {
       send(res, 200, { categories: BEST_CATEGORIES });
@@ -469,7 +787,7 @@ const server = http.createServer(async (req, res) => {
     if (await handleUser(req, res, url)) return;
 
     if (url.pathname === "/api/collect" && req.method === "POST") {
-      const result = await collectPriceSnapshot(client, history, library);
+      const result = await collectPriceSnapshot(client, history, accountBook.libraries());
       send(res, 200, { ...result, ...collectMeta() });
       return;
     }
@@ -511,9 +829,78 @@ const server = http.createServer(async (req, res) => {
         send(res, 404, { error: "추적 중인 상품이 아닙니다." });
         return;
       }
+      const deal = dealIndex().get(id);
+      const current = deal || product;
+      const family = deal?.familyKey
+        ? [...dealIndex().values()]
+            .filter((item) => item.familyKey === deal.familyKey && String(item.productId) !== id)
+            .sort((a, b) => (a.unitRank ?? 99) - (b.unitRank ?? 99) || (a.productPrice ?? 0) - (b.productPrice ?? 0))
+            .slice(0, 8)
+        : [];
       send(res, 200, {
-        ...decorate([product])[0],
-        alternatives: decorate(cheaperAlternatives(product, history.listAll(), 3)),
+        ...decorate([current])[0],
+        family: decorate(family),
+        alternatives: decorate(cheaperAlternatives(current, history.listAll(), 3)),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/catalog") {
+      const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+      const category = (url.searchParams.get("category") || "").trim();
+      let rows = [...dealIndex().values()];
+      if (q) {
+        rows = rows.filter((product) => {
+          const name = (product.productName || "").toLowerCase();
+          return name.includes(q) || product.familyName.toLowerCase().includes(q) || product.brand.toLowerCase().includes(q);
+        });
+      }
+      if (category) {
+        rows = rows.filter((product) => (product.categoryName || "").includes(category));
+      }
+      rows.sort((a, b) => b.dealScore - a.dealScore || (a.productPrice ?? 0) - (b.productPrice ?? 0));
+      send(res, 200, {
+        products: decorate(rows.slice(0, 80)),
+        cached: true,
+        at: history.lastCollectAt || Date.now(),
+        source: "catalog",
+        title: q ? `'${q}' 상품 사전` : "상품 사전",
+        query: q,
+        total: rows.length,
+        ...collectMeta(),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/units") {
+      const rows = [...dealIndex().values()]
+        .filter((product) => product.unitRank === 1 && product.familySize >= 2)
+        .sort((a, b) => b.dealScore - a.dealScore || (a.productPrice ?? 0) - (b.productPrice ?? 0))
+        .slice(0, 60);
+      send(res, 200, {
+        products: decorate(rows),
+        cached: true,
+        at: history.lastCollectAt || Date.now(),
+        source: "units",
+        title: "단위가격이 가장 싼 상품",
+        ...collectMeta(),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/family") {
+      const key = (url.searchParams.get("key") || "").trim();
+      const rows = [...dealIndex().values()]
+        .filter((product) => product.familyKey === key)
+        .sort((a, b) => (a.unitRank ?? 99) - (b.unitRank ?? 99) || (a.productPrice ?? 0) - (b.productPrice ?? 0));
+      send(res, 200, {
+        products: decorate(rows),
+        cached: true,
+        at: history.lastCollectAt || Date.now(),
+        source: "family",
+        title: rows[0]?.familyName || "상품군",
+        query: key,
+        ...collectMeta(),
       });
       return;
     }
@@ -552,6 +939,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (isStoreHost(req) && (url.pathname === "/" || url.pathname === "/index.html")) {
+      serveStatic("/store.html", res);
+      return;
+    }
+
     if (url.pathname.startsWith("/share/")) {
       const id = decodeURIComponent(url.pathname.slice("/share/".length).split("/")[0] || "");
       const product = history.getById(id);
@@ -570,14 +962,17 @@ const server = http.createServer(async (req, res) => {
     const message = err instanceof Error ? err.message : String(err);
     send(res, 502, { error: message });
   }
+  });
 });
 
-attachStores(history, library)
+attachStores(history, rootLibrary)
+  .then(() => accountBook.open())
   .then(() => {
     server.listen(PORT, () => {
       console.log(`셀러딜  http://127.0.0.1:${PORT}`);
-      startPriceCollector(client, history, COLLECT_INTERVAL, library);
-      startDigest(history, library);
+      if (STORE_HOSTS.size) console.log(`스토어 도메인  ${[...STORE_HOSTS].join(", ")}`);
+      startPriceCollector(client, history, COLLECT_INTERVAL, () => accountBook.libraries());
+      startDigest(history, () => accountBook.libraries());
     });
   })
   .catch((error) => {

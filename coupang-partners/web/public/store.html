@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>스토어</title>
+    <meta name="description" content="번호나 상품 이름으로 찾는 쿠팡 파트너스 스토어입니다." />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css"
+    />
+    <link rel="stylesheet" href="/store.css" />
+  </head>
+  <body>
+    <div class="phone">
+      <main class="sf" id="listView">
+        <p class="sf-note">쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.</p>
+        <header class="sf-profile">
+          <button class="icon-btn" id="shareBtn" type="button" aria-label="링크 복사">공유</button>
+          <div class="sf-avatar" id="avatar" aria-hidden="true">딜</div>
+          <h1 id="name">스토어</h1>
+          <p id="tagline">번호 또는 상품 이름으로 검색하세요</p>
+          <button class="biz-btn" id="bizBtn" type="button">비즈니스 제안</button>
+        </header>
+        <form class="sf-search" id="search">
+          <input id="query" type="search" placeholder="번호 또는 상품 이름" autocomplete="off" enterkeyhint="search" inputmode="search" />
+        </form>
+        <p class="sf-count" id="count" hidden></p>
+        <div id="shelves">
+          <p class="sf-loading">상품을 불러오는 중…</p>
+        </div>
+      </main>
+
+      <section class="proposal" id="proposal" hidden>
+        <header class="proposal-bar">
+          <button class="text-btn" id="proposalBack" type="button">닫기</button>
+          <h1>비즈니스 제안</h1>
+        </header>
+        <form id="proposalForm">
+          <p class="field-label">캠페인 유형</p>
+          <div class="chips" id="typeChips">
+            <button type="button" data-type="광고">광고</button>
+            <button type="button" data-type="공동구매">공동구매</button>
+            <button type="button" data-type="협찬">협찬</button>
+            <button type="button" data-type="제품제공">제품제공</button>
+            <button type="button" data-type="기타">기타</button>
+          </div>
+          <label>브랜드<input id="brand" maxlength="100" placeholder="브랜드명, 100자 이내" /></label>
+          <label>상품/서비스명<input id="productName" maxlength="100" placeholder="제공하는 상품 또는 서비스" /></label>
+          <p class="field-label">제품 카테고리</p>
+          <div class="chips" id="catChips">
+            <button type="button" data-cat="육아·키즈">육아·키즈</button>
+            <button type="button" data-cat="홈·리빙">홈·리빙</button>
+            <button type="button" data-cat="식품·요리">식품·요리</button>
+            <button type="button" data-cat="뷰티">뷰티</button>
+            <button type="button" data-cat="패션">패션</button>
+            <button type="button" data-cat="디지털·가전">디지털·가전</button>
+            <button type="button" data-cat="가구·인테리어">가구·인테리어</button>
+            <button type="button" data-cat="스포츠·건강">스포츠·건강</button>
+            <button type="button" data-cat="여행·아웃도어">여행·아웃도어</button>
+            <button type="button" data-cat="교육·커리어">교육·커리어</button>
+            <button type="button" data-cat="취미·아트">취미·아트</button>
+            <button type="button" data-cat="반려동물">반려동물</button>
+            <button type="button" data-cat="기타">기타</button>
+          </div>
+          <label>특징<textarea id="detail" maxlength="2000" rows="4" placeholder="브랜드, 제품, 캠페인을 적어 주세요"></textarea></label>
+          <div class="dates">
+            <label>시작일<input id="start" type="date" /></label>
+            <label>종료일<input id="end" type="date" /></label>
+          </div>
+          <label>보상 형태
+            <select id="payType">
+              <option value="">선택</option>
+              <option value="cash">정액형 (원)</option>
+              <option value="profit_share">수익배분형 (%)</option>
+              <option value="negotiation">미정·협의가능</option>
+            </select>
+          </label>
+          <label>보상 금액<input id="payAmount" inputmode="numeric" placeholder="보상 형태를 먼저 선택" disabled /></label>
+          <label>제안서<textarea id="letter" maxlength="2000" rows="6" placeholder="제안 내용을 작성하거나 초안을 만드세요"></textarea></label>
+          <button class="ghost" id="draftBtn" type="button">제안서 초안 만들기</button>
+          <p class="field-label">담당자</p>
+          <label>이름<input id="contactName" maxlength="40" placeholder="이름" /></label>
+          <label>이메일<input id="email" type="email" maxlength="80" placeholder="reply@company.com" /></label>
+          <label>전화번호<input id="phone" type="tel" maxlength="20" placeholder="010-0000-0000" /></label>
+          <input id="website" class="hp" tabindex="-1" autocomplete="off" />
+          <p class="form-error" id="formError" hidden></p>
+          <button class="submit" type="submit">제안 보내기</button>
+        </form>
+        <div class="proposal-done" id="proposalDone" hidden>
+          <strong>제안을 보냈습니다</strong>
+          <span>확인 후 연락드리겠습니다.</span>
+          <button class="submit" id="doneClose" type="button">상품 목록으로</button>
+        </div>
+      </section>
+      <button class="sf-top" id="top" type="button">맨위</button>
+    </div>
+    <script src="/store.js"></script>
+  </body>
+</html>

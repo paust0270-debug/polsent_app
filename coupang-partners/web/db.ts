@@ -56,6 +56,13 @@ create table if not exists polsent.price_daily (
   primary key (product_id, day)
 );
 
+create table if not exists polsent.price_ticks (
+  product_id text not null references polsent.products(product_id) on delete cascade,
+  seen_at bigint not null,
+  price integer not null,
+  primary key (product_id, seen_at)
+);
+
 create table if not exists polsent.app_state (
   id integer primary key check (id = 1),
   last_collect_at bigint
@@ -162,6 +169,7 @@ create table if not exists polsent.meta (
 
 alter table polsent.products enable row level security;
 alter table polsent.price_daily enable row level security;
+alter table polsent.price_ticks enable row level security;
 alter table polsent.app_state enable row level security;
 alter table polsent.profile enable row level security;
 alter table polsent.watches enable row level security;
@@ -178,6 +186,18 @@ alter table polsent.push_subscriptions enable row level security;
 alter table polsent.alerts enable row level security;
 alter table polsent.alert_dedupe enable row level security;
 alter table polsent.meta enable row level security;
+
+create table if not exists polsent.accounts (
+  id text primary key,
+  code text not null unique,
+  claimed boolean not null default false,
+  document jsonb not null default '{}'::jsonb,
+  updated_at bigint not null default 0
+);
+alter table polsent.accounts enable row level security;
+
+alter table polsent.products add column if not exists original_price integer;
+alter table polsent.profile add column if not exists pin_cursor integer not null default 0;
 
 revoke all on schema polsent from public;
 revoke all on all tables in schema polsent from public;
@@ -217,16 +237,16 @@ function clone<T>(value: T): T {
 async function insertHistory(client: pg.PoolClient, file: HistoryFile) {
   const snap = clone(file);
   const products = Object.values(snap.products);
-  await client.query("truncate polsent.price_daily, polsent.products, polsent.app_state");
+  await client.query("truncate polsent.price_ticks, polsent.price_daily, polsent.products, polsent.app_state");
   if (products.length) {
     await client.query(
       `insert into polsent.products (
          product_id, product_name, product_image, product_url, category_name,
-         is_rocket, is_free_shipping, last_price, last_seen_at, source
+         is_rocket, is_free_shipping, last_price, last_seen_at, source, original_price
        )
        select * from unnest(
          $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-         $6::boolean[], $7::boolean[], $8::int[], $9::bigint[], $10::text[]
+         $6::boolean[], $7::boolean[], $8::int[], $9::bigint[], $10::text[], $11::int[]
        )`,
       [
         products.map((item) => item.productId),
@@ -239,6 +259,7 @@ async function insertHistory(client: pg.PoolClient, file: HistoryFile) {
         products.map((item) => item.lastPrice),
         products.map((item) => item.lastSeenAt),
         products.map((item) => item.source || ""),
+        products.map((item) => item.originalPrice ?? null),
       ],
     );
     const days: { productId: string; day: string; price: number }[] = [];
@@ -253,6 +274,25 @@ async function insertHistory(client: pg.PoolClient, file: HistoryFile) {
         `insert into polsent.price_daily (product_id, day, price)
          select * from unnest($1::text[], $2::date[], $3::int[])`,
         [days.map((item) => item.productId), days.map((item) => item.day), days.map((item) => item.price)],
+      );
+    }
+    const ticks: { productId: string; at: number; price: number }[] = [];
+    const seenTicks = new Set<string>();
+    for (const product of products) {
+      for (const tick of product.observations || []) {
+        if (!Number.isFinite(tick.at) || !Number.isFinite(tick.price)) continue;
+        const key = `${product.productId}:${tick.at}`;
+        if (seenTicks.has(key)) continue;
+        seenTicks.add(key);
+        ticks.push({ productId: product.productId, at: tick.at, price: tick.price });
+      }
+    }
+    for (let index = 0; index < ticks.length; index += 5000) {
+      const slice = ticks.slice(index, index + 5000);
+      await client.query(
+        `insert into polsent.price_ticks (product_id, seen_at, price)
+         select * from unnest($1::text[], $2::bigint[], $3::int[])`,
+        [slice.map((item) => item.productId), slice.map((item) => item.at), slice.map((item) => item.price)],
       );
     }
   }
@@ -285,8 +325,8 @@ async function insertLibrary(client: pg.PoolClient, file: LibraryFile) {
     `insert into polsent.profile (
        id, display_name, night_start, night_end, rocket_only,
        alert_lowest, alert_target, alert_restore, alert_restock, alert_keyword,
-       digest, digest_hour, last_digest_date
-     ) values (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+       digest, digest_hour, last_digest_date, pin_cursor
+     ) values (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
     [
       snap.displayName,
       settings.nightStart,
@@ -300,6 +340,7 @@ async function insertLibrary(client: pg.PoolClient, file: LibraryFile) {
       settings.digest,
       settings.digestHour,
       snap.lastDigestDate || "",
+      snap.pinCursor || 0,
     ],
   );
   await insertPairs(
@@ -445,11 +486,14 @@ async function withTransaction(run: (client: pg.PoolClient) => Promise<void>) {
 async function loadHistory(client: pg.PoolClient): Promise<HistoryFile> {
   const products = await client.query(
     `select product_id, product_name, product_image, product_url, category_name,
-            is_rocket, is_free_shipping, last_price, last_seen_at, source
+            is_rocket, is_free_shipping, last_price, last_seen_at, source, original_price
      from polsent.products`,
   );
   const daily = await client.query(
     "select product_id, to_char(day, 'YYYY-MM-DD') as day, price from polsent.price_daily",
+  );
+  const ticks = await client.query(
+    "select product_id, seen_at, price from polsent.price_ticks order by seen_at",
   );
   const state = await client.query("select last_collect_at from polsent.app_state where id = 1");
   const byId: Record<string, TrackedProduct> = {};
@@ -463,15 +507,29 @@ async function loadHistory(client: pg.PoolClient): Promise<HistoryFile> {
       isRocket: row.is_rocket,
       isFreeShipping: row.is_free_shipping,
       lastPrice: row.last_price,
+      originalPrice: row.original_price,
       lastSeenAt: row.last_seen_at,
       source: row.source,
       daily: {},
+      observations: [],
     };
   }
   for (const row of daily.rows) {
     const product = byId[row.product_id];
     if (!product) continue;
     product.daily[row.day] = row.price;
+  }
+  for (const row of ticks.rows) {
+    const product = byId[row.product_id];
+    if (!product || !Number.isFinite(row.seen_at) || !Number.isFinite(row.price)) continue;
+    product.observations.push({ at: row.seen_at, price: row.price });
+  }
+  for (const product of Object.values(byId)) {
+    if (product.observations.length) continue;
+    product.observations = Object.entries(product.daily)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([day, price]) => ({ at: Date.parse(`${day}T12:00:00+09:00`), price }))
+      .filter((item) => Number.isFinite(item.at));
   }
   return {
     version: 2,
@@ -560,6 +618,7 @@ async function loadLibrary(client: pg.PoolClient): Promise<LibraryFile> {
       read: alert.read,
     })),
     dedupe: Object.fromEntries(dedupe.rows.map((item) => [item.dedupe_key, item.day])),
+    pinCursor: row?.pin_cursor ?? 0,
   };
 }
 

@@ -19,6 +19,15 @@ const STOP = new Set([
 const VOLUME_RE = /(\d+(?:\.\d+)?)\s*(kg|g|ml|l)(?![a-z])/gi;
 const COUNT_RE = /(\d+(?:\.\d+)?)\s*(개입|매|팩|롤|병|캔|포|입|개)/g;
 
+type PackKind = "mass" | "volume" | "count";
+
+interface Pack {
+  unit: string;
+  qty: number;
+  kind: PackKind;
+  baseQty: number;
+}
+
 export function nameTokens(name: string): string[] {
   const cleaned = name.replace(/\[[^\]]*\]|\([^)]*\)/g, " ");
   const parts = cleaned.split(/[^\p{L}\p{N}]+/u);
@@ -32,19 +41,16 @@ export function nameTokens(name: string): string[] {
 }
 
 export function unitPriceLabel(name: string, price: number | null): string | null {
-  if (price == null || price <= 0 || !name) return null;
-  const volumes = [...name.matchAll(VOLUME_RE)]
-    .map((match) => ({ qty: Number(match[1]), unit: match[2].toLowerCase() }))
-    .filter((item) => item.qty > 0);
-  const counts = [...name.matchAll(COUNT_RE)]
-    .map((match) => ({ qty: Number(match[1]), unit: match[2] }))
-    .filter((item) => item.qty > 0);
-  const volume = volumes.at(-1);
-  const count = counts.at(-1);
-  if (volume && count) return perUnit(volume.unit, volume.qty * count.qty, price);
-  if (volume) return perUnit(volume.unit, volume.qty, price);
-  if (count) return perUnit(count.unit, count.qty, price);
-  return null;
+  const pack = parsePack(name);
+  if (!pack || price == null || price <= 0) return null;
+  return perUnit(pack.unit, pack.qty, price);
+}
+
+export function unitBasis(name: string, price: number | null): { kind: PackKind; per: number } | null {
+  const pack = parsePack(name);
+  if (!pack || price == null || price <= 0 || pack.baseQty <= 0) return null;
+  if (pack.kind === "count") return { kind: "count", per: Math.round(price / pack.baseQty) };
+  return { kind: pack.kind, per: Math.round((price / pack.baseQty) * 100) };
 }
 
 export function staleHours(lastSeenAt: number | null, now = Date.now()): number | null {
@@ -80,18 +86,61 @@ export function cheaperAlternatives(current: ProductView, products: ProductView[
   if (!current.productName || current.productPrice == null) return [];
   const mine = nameTokens(current.productName);
   if (!mine.length) return [];
-  const scored: { product: ProductView; score: number }[] = [];
+  const mineUnit = unitBasis(current.productName, current.productPrice);
+  const scored: { product: ProductView; score: number; rank: number }[] = [];
   for (const product of products) {
     if (product.productId === current.productId || product.productPrice == null) continue;
-    if (product.productPrice >= current.productPrice) continue;
     const other = nameTokens(product.productName || "");
     const shared = mine.filter((token) => other.includes(token));
     const strong = shared.some((token) => token.length >= 4);
     if (shared.length < 2 && !strong) continue;
-    scored.push({ product, score: shared.length });
+    const otherUnit = unitBasis(product.productName || "", product.productPrice);
+    const sameUnit = mineUnit && otherUnit && mineUnit.kind === otherUnit.kind;
+    if (sameUnit) {
+      if (otherUnit.per >= mineUnit.per) continue;
+      scored.push({ product, score: shared.length, rank: otherUnit.per });
+      continue;
+    }
+    if (product.productPrice >= current.productPrice) continue;
+    scored.push({ product, score: shared.length, rank: product.productPrice });
   }
-  scored.sort((a, b) => b.score - a.score || (a.product.productPrice ?? 0) - (b.product.productPrice ?? 0));
+  scored.sort((a, b) => b.score - a.score || a.rank - b.rank);
   return scored.slice(0, limit).map((row) => row.product);
+}
+
+function parsePack(name: string): Pack | null {
+  if (!name) return null;
+  const volumes = [...name.matchAll(new RegExp(VOLUME_RE.source, "gi"))]
+    .map((match) => ({ qty: Number(match[1]), unit: match[2].toLowerCase() }))
+    .filter((item) => item.qty > 0);
+  const counts = [...name.matchAll(new RegExp(COUNT_RE.source, "g"))]
+    .map((match) => ({ qty: Number(match[1]), unit: match[2] }))
+    .filter((item) => item.qty > 0);
+  const volume = volumes.at(-1);
+  const count = counts.at(-1);
+  if (volume) {
+    const base = toBase(volume.unit, volume.qty);
+    if (!base) return null;
+    const times = count ? count.qty : 1;
+    return {
+      unit: volume.unit,
+      qty: volume.qty * times,
+      kind: base.kind,
+      baseQty: base.qty * times,
+    };
+  }
+  if (count) {
+    return { unit: count.unit, qty: count.qty, kind: "count", baseQty: count.qty };
+  }
+  return null;
+}
+
+function toBase(unit: string, qty: number): { kind: "mass" | "volume"; qty: number } | null {
+  if (unit === "kg") return { kind: "mass", qty: qty * 1000 };
+  if (unit === "g") return { kind: "mass", qty };
+  if (unit === "l") return { kind: "volume", qty: qty * 1000 };
+  if (unit === "ml") return { kind: "volume", qty };
+  return null;
 }
 
 function perUnit(unit: string, qty: number, price: number): string | null {

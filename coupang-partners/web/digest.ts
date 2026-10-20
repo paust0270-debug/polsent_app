@@ -24,8 +24,8 @@ export function buildDigest(history: PriceHistoryStore, library: UserLibrary): s
   return `관심 ${ids.length}개 중 타이밍 ${timing}, 목표가 ${targets}, 산 가격보다 낮은 상품 ${cheaper}`;
 }
 
-export function startDigest(history: PriceHistoryStore, library: UserLibrary) {
-  const tick = () => {
+export function startDigest(history: PriceHistoryStore, libraries: () => UserLibrary[]) {
+  const tickOne = (library: UserLibrary) => {
     const settings = library.settings;
     if (!settings.digest) return;
     const day = kstDate();
@@ -43,6 +43,9 @@ export function startDigest(history: PriceHistoryStore, library: UserLibrary) {
       body: note.body,
     });
     if (created) void notifyAlerts(library, [note], true);
+  };
+  const tick = () => {
+    for (const library of libraries()) tickOne(library);
   };
   tick();
   const timer = setInterval(tick, 60_000);
